@@ -1,0 +1,158 @@
+package com.klef.resumedetector.service;
+
+import com.klef.resumedetector.ai.CosineSimilarityScorer;
+import com.klef.resumedetector.dto.CandidateRankDto;
+import com.klef.resumedetector.dto.ScoreResponseDto;
+import com.klef.resumedetector.entity.JobRole;
+import com.klef.resumedetector.entity.Resume;
+import com.klef.resumedetector.entity.Score;
+import com.klef.resumedetector.repository.JobRoleRepository;
+import com.klef.resumedetector.repository.ResumeRepository;
+import com.klef.resumedetector.repository.ScoreRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+@Service
+public class ScoringServiceImpl implements ScoringService {
+
+    @Autowired
+    private CosineSimilarityScorer cosineSimilarityScorer;
+
+    @Autowired
+    private ScoreRepository scoreRepository;
+
+    @Autowired
+    private ResumeRepository resumeRepository;
+
+    @Autowired
+    private JobRoleRepository jobRoleRepository;
+
+    @Override
+    public ScoreResponseDto scoreResume(Long resumeId, Long jobRoleId) {
+        Resume resume = resumeRepository.findById(resumeId)
+                .orElseThrow(() -> new RuntimeException("Resume not found: " + resumeId));
+
+        JobRole jobRole = jobRoleRepository.findById(jobRoleId)
+                .orElseThrow(() -> new RuntimeException("JobRole not found: " + jobRoleId));
+
+        // skip if already scored
+        if (scoreRepository.existsByResumeIdAndJobRoleId(resumeId, jobRoleId)) {
+            Score existing = scoreRepository.findByResumeIdAndJobRoleId(resumeId, jobRoleId)
+                    .orElseThrow();
+            return mapToScoreResponseDto(existing);
+        }
+
+        try {
+
+            // skill matching json
+            String skillMatchJson = cosineSimilarityScorer.getSkillMatchJson(
+                    resume.getSkillsJson(),
+                    jobRole.getRequiredSkills()
+            );
+
+            // parse json
+            com.fasterxml.jackson.databind.ObjectMapper mapper =
+                    new com.fasterxml.jackson.databind.ObjectMapper();
+
+            java.util.Map<String, Object> matchData =
+                    mapper.readValue(skillMatchJson, java.util.Map.class);
+
+            int matchedCount = (int) matchData.get("matchedCount");
+            int totalRequired = (int) matchData.get("totalRequired");
+
+            // score = (matched / total) * 100
+            double fitScore = totalRequired > 0
+                    ? ((double) matchedCount / totalRequired) * 100
+                    : 0.0;
+
+            // build and save score entity
+            Score score = new Score();
+
+            score.setResume(resume);
+            score.setJobRole(jobRole);
+
+            // round to 1 decimal place
+            score.setFitScore(Math.round(fitScore * 10.0) / 10.0);
+
+            score.setSkillMatchJson(skillMatchJson);
+
+            // NEW FIELDS
+            score.setMatchedSkillsCount(matchedCount);
+            score.setTotalRequiredSkills(totalRequired);
+
+            scoreRepository.save(score);
+
+            return mapToScoreResponseDto(score);
+
+        } catch (Exception e) {
+            throw new RuntimeException("Error while scoring resume", e);
+        }
+    }
+    @Override
+    public List<ScoreResponseDto> scoreAllResumesForJob(Long jobRoleId) {
+        List<Resume> unscored = resumeRepository.findUnScoredResumesForJob(jobRoleId);
+        
+        // keep only latest resume per user
+        Map<Long, Resume> latestPerUser = new LinkedHashMap<>();
+        for (Resume r : unscored) {
+            latestPerUser.put(r.getUser().getId(), r);
+        }
+        
+        List<ScoreResponseDto> results = new ArrayList<>();
+        for (Resume resume : latestPerUser.values()) {
+            results.add(scoreResume(resume.getId(), jobRoleId));
+        }
+        return results;
+    }
+
+    @Override
+    public List<CandidateRankDto> getRankedCandidates(Long jobRoleId) {
+        List<Score> scores = scoreRepository.findByJobRoleIdOrderByFitScoreDesc(jobRoleId);
+        List<CandidateRankDto> ranked = new ArrayList<>();
+        int rank = 1;
+        for (Score score : scores) {
+            ranked.add(mapToCandidateRankDto(score, rank++));
+        }
+        return ranked;
+    }
+
+    @Override
+    public List<CandidateRankDto> getTopNCandidates(Long jobRoleId, int topN) {
+        List<Score> scores = scoreRepository.findTopCandidatesForJob(jobRoleId, topN);
+        List<CandidateRankDto> ranked = new ArrayList<>();
+        int rank = 1;
+        for (Score score : scores) {
+            ranked.add(mapToCandidateRankDto(score, rank++));
+        }
+        return ranked;
+    }
+
+    // ── mappers ────────────────────────────────────────────────
+    private ScoreResponseDto mapToScoreResponseDto(Score score) {
+        ScoreResponseDto dto = new ScoreResponseDto();
+        dto.setScoreId(score.getId());
+        dto.setResumeId(score.getResume().getId());
+        dto.setJobRoleId(score.getJobRole().getId());
+        dto.setJobTitle(score.getJobRole().getTitle());
+        dto.setFitScore(score.getFitScore());
+        dto.setSkillMatchJson(score.getSkillMatchJson());
+        dto.setScoredAt(score.getScoredAt());
+        return dto;
+    }
+
+    private CandidateRankDto mapToCandidateRankDto(Score score, int rank) {
+        CandidateRankDto dto = new CandidateRankDto();
+        dto.setRank(rank);
+        dto.setResumeId(score.getResume().getId());
+        dto.setCandidateName(score.getResume().getCandidateName());
+        dto.setCandidateEmail(score.getResume().getCandidateEmail());
+        dto.setFitScore(score.getFitScore());
+        dto.setSkillMatchJson(score.getSkillMatchJson());
+        return dto;
+    }
+}
